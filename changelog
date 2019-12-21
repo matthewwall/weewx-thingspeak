@@ -1,0 +1,22 @@
+0.7 25apr2016
+* remove dependency on wx_binding
+
+0.6 31oct2015
+* fix true/false configuration bug
+
+0.5 14oct2015
+* update readme with weewx 3.x instructions
+
+0.4 23mar2015
+* fail hard if unit system is not known
+
+0.3 30jan2015
+* added augment_record option
+
+0.2 25jan2015
+* fixed typo in install.py: ThingSpeakInstaller not ThinkSpeakInstaller
+
+0.1  06dec2014
+* initial release as packaged weewx extension for weewx v3
+* added system to specify which observations are uploaded
+* added system to specify per-observation labels, units, and formatting
