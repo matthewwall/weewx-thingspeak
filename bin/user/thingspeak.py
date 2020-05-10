@@ -1,5 +1,4 @@
-# $Id: thingspeak.py 1483 2016-04-25 06:53:19Z mwall $
-# Copyright 2013-2014 Matthew Wall
+# Copyright 2013-2020 Matthew Wall
 
 """
 ThingSpeak calls itself "The open data platform for the internet of things".
@@ -31,35 +30,65 @@ This is a weewx extension that uploads data to ThingSpeak.
                 format = %.3f
 """
 
-import Queue
+try:
+    # Python 3
+    import queue
+except ImportError:
+    # Python 2
+    import Queue as queue
 import sys
 import syslog
 import time
-import urllib
-import urllib2
+try:
+    # Python 3
+    from urllib.parse import urlencode
+except ImportError:
+    # Python 2
+    from urllib import urlencode
 
 import weewx
 import weewx.restx
 import weewx.units
-from weeutil.weeutil import to_bool, accumulateLeaves
+from weeutil.weeutil import to_bool
 
-VERSION = "0.7"
+VERSION = "0.8"
 
 if weewx.__version__ < "3":
     raise weewx.UnsupportedFeature("weewx 3 is required, found %s" %
                                    weewx.__version__)
 
-def logmsg(level, msg):
-    syslog.syslog(level, 'restx: ThingSpeak: %s' % msg)
+try:
+    # Test for new-style weewx logging by trying to import weeutil.logger
+    import weeutil.logger
+    import logging
 
-def logdbg(msg):
-    logmsg(syslog.LOG_DEBUG, msg)
+    log = logging.getLogger(__name__)
 
-def loginf(msg):
-    logmsg(syslog.LOG_INFO, msg)
+    def logdbg(msg):
+        log.debug(msg)
 
-def logerr(msg):
-    logmsg(syslog.LOG_ERR, msg)
+    def loginf(msg):
+        log.info(msg)
+
+    def logerr(msg):
+        log.error(msg)
+
+except ImportError:
+    # Old-style weewx logging
+    import syslog
+
+    def logmsg(level, msg):
+        syslog.syslog(level, 'ThingSpeak: %s' % msg)
+
+    def logdbg(msg):
+        logmsg(syslog.LOG_DEBUG, msg)
+
+    def loginf(msg):
+        logmsg(syslog.LOG_INFO, msg)
+
+    def logerr(msg):
+        logmsg(syslog.LOG_ERR, msg)
+
 
 def _obfuscate(s):
     return ('X'*(len(s)-4) + s[-4:])
@@ -131,41 +160,31 @@ class ThingSpeak(weewx.restx.StdRESTbase):
         """
         super(ThingSpeak, self).__init__(engine, config_dict)        
         loginf("service version is %s" % VERSION)
-        try:
-            site_dict = config_dict['StdRESTful']['ThingSpeak']
-            site_dict = accumulateLeaves(site_dict, max_level=1)
-            site_dict['api_key']
-        except KeyError, e:
-            logerr("Data will not be uploaded: Missing option %s" % e)
+        site_dict = weewx.restx.get_site_dict(config_dict, 'ThingSpeak', 'api_key')
+        if site_dict is None:
             return
 
-        site_dict.setdefault('augment_record', True)
-        site_dict['augment_record'] = to_bool(site_dict.get('augment_record'))
-
-        usn = site_dict.get('unit_system', None)
+        # if a unit system was specified, get the weewx constant for it. do it here so a bogus unit system will cause
+        # weewx to die immediately
+        usn = site_dict.get('unit_system')
         if usn is not None:
             site_dict['unit_system'] = weewx.units.unit_constants[usn]
-
-        site_dict.setdefault('fields', self._DEFAULT_FIELDS)
+            loginf('units will be converted to %s' % usn)
 
         # if we are supposed to augment the record with data from weather
         # tables, then get the manager dict to do it.  there may be no weather
         # tables, so be prepared to fail.
         try:
             if site_dict.get('augment_record'):
-                _manager_dict = weewx.manager.get_manager_dict_from_config(
-                    config_dict, 'wx_binding')
-                site_dict['manager_dict'] = _manager_dict
+                site_dict['manager_dict'] = weewx.manager.get_manager_dict_from_config(config_dict, 'wx_binding')
         except weewx.UnknownBinding:
             pass
 
-        self.archive_queue = Queue.Queue()
+        self.archive_queue = queue.Queue()
         self.archive_thread = ThingSpeakThread(self.archive_queue, **site_dict)
         self.archive_thread.start()
         self.bind(weewx.NEW_ARCHIVE_RECORD, self.new_archive_record)
 
-        if usn is not None:
-            loginf("desired unit system is %s" % usn)
         loginf("Data will be uploaded using api_key %s" %
                _obfuscate(site_dict['api_key']))
 
@@ -177,10 +196,10 @@ class ThingSpeakThread(weewx.restx.RESTThread):
     _DEFAULT_SERVER_URL = 'http://api.thingspeak.com/update'
 
     def __init__(self, queue, api_key,
-                 fields=None, unit_system=None, augment_record=True,
+                 fields=ThingSpeak._DEFAULT_FIELDS, unit_system=None, augment_record=True,
                  server_url=_DEFAULT_SERVER_URL, skip_upload=False,
                  manager_dict=None,
-                 post_interval=None, max_backlog=sys.maxint, stale=None,
+                 post_interval=None, max_backlog=sys.maxsize, stale=None,
                  log_success=True, log_failure=True,
                  timeout=60, max_tries=3, retry_wait=5):
         super(ThingSpeakThread, self).__init__(queue,
@@ -193,34 +212,46 @@ class ThingSpeakThread(weewx.restx.RESTThread):
                                                log_failure=log_failure,
                                                max_tries=max_tries,
                                                timeout=timeout,
-                                               retry_wait=retry_wait)
+                                               retry_wait=retry_wait,
+                                               skip_upload=skip_upload)
         self.api_key = api_key
         self.server_url = server_url
         self.fields = fields
         self.unit_system = unit_system
-        self.augment_record = augment_record
-        self.skip_upload = to_bool(skip_upload)
+        self.augment_record = to_bool(augment_record)
 
-    def process_record(self, record, dbm):
-        if self.augment_record and dbm:
-            record = self.get_record(record, dbm)
+    def get_record(self, record, dbm):
+        """Override and augment if requested, change unit system if requested."""
+        # Don't augment the record unless asked for.
+        if self.augment_record:
+            aug_record = super(ThingSpeakThread, self).get_record(record, dbm)
+        else:
+            aug_record = record
+
+        # Convert the unit system if asked for.
         if self.unit_system is not None:
-            record = weewx.units.to_std_system(record, self.unit_system)
-        url = self.get_url(record)
-        if self.skip_upload:
-            loginf("skipping upload")
-            return
-        req = urllib2.Request(url)
-        req.add_header("User-Agent", "weewx/%s" % weewx.__version__)
-        req.add_header("THINGSPEAKAPIKEY", "%s" % self.api_key)
-        self.post_with_retries(req)
+            final_record = weewx.units.to_std_system(aug_record, self.unit_system)
+        else:
+            final_record = aug_record
+
+        return final_record
+
+    def get_request(self, url):
+        """Override and add THINGSPEAKAPIKEY header"""
+
+        # Get the basic Request from my superclass
+        request = super(ThingSpeakThread, self).get_request(url)
+
+        # Add a header
+        request.add_header("THINGSPEAKAPIKEY", "%s" % self.api_key)
+        return request
 
     def check_response(self, response):
         txt = response.read()
         if txt == '0' :
             raise weewx.restx.FailedPost("Posting failed")
 
-    def get_url(self, record):
+    def format_url(self, record):
         tstr = time.strftime('%Y-%m-%dT%H:%M:%SZ',
                              time.gmtime(record['dateTime']))
         parts = {'datetime': tstr}
@@ -239,6 +270,53 @@ class ThingSpeakThread(weewx.restx.RESTThread):
             except (TypeError, ValueError):
                 pass
 
-        url = self.server_url + '?' + urllib.urlencode(parts)
+        url = self.server_url + '?' + urlencode(parts)
         logdbg('url: %s' % url)
         return url
+
+
+# Do direct testing of this extension like this:
+#   PYTHONPATH=WEEWX_BINDIR python WEEWX_BINDIR/user/thingspeak.py
+if __name__ == "__main__":
+    import optparse
+
+    weewx.debug = 2
+
+    try:
+        # WeeWX V4 logging
+        weeutil.logger.setup('thingspeak', {})
+    except NameError:
+        # WeeWX V3 logging
+        syslog.openlog('thingspeak', syslog.LOG_PID | syslog.LOG_CONS)
+        syslog.setlogmask(syslog.LOG_UPTO(syslog.LOG_DEBUG))
+
+    usage = """%prog [--api-key=API-KEY] [--unit-system=US|METRIC|METRICWX] [--version] [--help]"""
+
+    parser = optparse.OptionParser(usage=usage)
+    parser.add_option('--version', dest='version', action='store_true',
+                      help='display uploader version')
+    parser.add_option('--api-key', metavar="API-KEY",
+                      help='ThingSpeak API key to use')
+    parser.add_option('--unit-system', help='Unit system to use')
+    (options, args) = parser.parse_args()
+
+    if options.version:
+        print("ThingSpeak uploader version %s" % VERSION)
+        exit(0)
+
+    print("uploading to API key '%s'" % options.api_key)
+    unit_system=weewx.units.unit_constants.get(options.unit_system)
+    if unit_system:
+        print("using unit system %d" % unit_system)
+    else:
+        print("using native unit system")
+    q = queue.Queue()
+    t = ThingSpeakThread(q, manager_dict=None, api_key=options.api_key, unit_system=unit_system)
+    t.start()
+    q.put({'dateTime': int(time.time() + 0.5),
+           'usUnits': weewx.US,
+           'outTemp': 32.5,
+           'inTemp': 75.8,
+           'outHumidity': 24})
+    q.put(None)
+    t.join(30)

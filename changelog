@@ -1,3 +1,6 @@
+0.8 08may2020
+* Ported to Python 3 and WeeWX V4. -tk
+
 0.7 25apr2016
 * remove dependency on wx_binding
 
