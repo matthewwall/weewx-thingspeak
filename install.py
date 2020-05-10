@@ -12,7 +12,7 @@ def loader():
 class ThingSpeakInstaller(ExtensionInstaller):
     def __init__(self):
         super(ThingSpeakInstaller, self).__init__(
-            version="0.8",
+            version="0.9",
             name='thingspeak',
             description='Upload weather data to ThingSpeak.',
             author="Matthew Wall",
